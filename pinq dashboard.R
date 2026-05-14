@@ -2,12 +2,13 @@ library(tidyverse)
 library(lubridate)
 library(readxl)
 library(odbc)
+library(janitor)
 
 con <- dbConnect(odbc(), "CaboodleProd")
 
 monthlabs <- c(
-  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
 )
 
 bmcpprov <- c(
@@ -24,7 +25,41 @@ uteprovs <- c("15643", "3664", "5009553", "5010324", "15635", "5014355",
                 "15882", "5005608", "5007237", "5014593", "5013828", "5017851", 
                 "425252")
 
+ttgprov <- c("15643", "3664", "5009553", "5010324", "15635", "5014355", "3391", 
+             "5020174", "2912", "13644", "5002955", "5004188", "15882", 
+             "5005608", "5007237", "5014593", "5013828", "5017851", "425252")
+
 patlevel <- c("Butler BH", "Community BH", "NewPath", "Transitions")
+
+monthlist <- seq.Date(as.Date("2022-01-01"), as.Date(floor_date(today() - 30)), by = "month")
+
+dateframe <- tibble(
+  Month = rep(monthlist, 74),
+  Measure = rep(
+    c("Crisis Stabilization", "Initial Intake"),
+    each = length(monthlist),
+    37
+    ),
+  Practice = rep(
+    c(
+      "Anderson Hills Pediatrics", "Best Point", "BMCP", "Butler BH", 
+      "Catalyst", "Centerpoint Health", "CHSN Anderson Primary Care", 
+      "CHSN Batesville Primary Care", "CHSN Cold Spring Primary Care",
+      "CHSN Greensburg Primary Care", "CHSN Kenwood Crossing Primary Care", 
+      "CHSN Liberty Primary Care", "CHSN Loveland Primary Care", 
+      "CHSN Mason Primary Care", "CHSN Rockdale Primary Care", 
+      "CHSN Southgate Primary Care", "CHSN Union Primary Care",
+      "CHSN Wilmington Primary Care", "Cincinnati Health Department", 
+      "Community BH", "Community IBH", "Crossroad Health Center", 
+      "ESD Pediatrics", "Liberty Sharonville Pediatrics", "MLS", 
+      "Montgomery Pediatrics", "Muddy Creek Pediatrics", "NewPath", "NKY",
+      "OneQuest", "Pediatrics of Florence", "Pediatrics Of Florence", "Poppys",
+      "Psychiatry", "Springdale Mason Pediatrics", "Transitions", 
+      "West Side Pediatrics"
+      ),
+    each = length(monthlist) * 2
+    )
+)
 
 aeu <- read_excel(
   "old data.xlsx",
@@ -123,6 +158,257 @@ newdata <- newdata |>
     ) |>
   mutate(Practice = ifelse(Practice == "CHNK", "OneQuest", Practice))
 
+# IHN Practices
+
+setwd("C:/Users/FLI6SH/OneDrive - cchmc/Documents/Behavioral Health/PINQ/PINQ-Dashboard/IBH")
+
+ibhfiles <- list.files()
+
+for(p in ibhfiles){
+  x <- read_excel(
+    p, 
+    col_names = c("Practice", "monthname", "year", "II", "Crisis", "Denominator"),
+    skip = 1
+  ) |>
+    filter(!is.na(monthname)) |> 
+    mutate(
+      monthname = coalesce(monthname, lag(monthname)),
+      year = coalesce(year, lag(year)),
+      monthname = case_when(
+        monthname == "January" ~ "01",
+        monthname == "February" ~ "02",
+        monthname == "March" ~ "03",
+        monthname == "April" ~ "04",
+        monthname == "May" ~ "05",
+        monthname == "June" ~ "06",
+        monthname == "July" ~ "07",
+        monthname == "August" ~ "08",
+        monthname == "September" ~ "09",
+        monthname == "October" ~ "10",
+        monthname == "November" ~ "11",
+        monthname == "December" ~ "12",
+      ),
+      Month = as.Date(paste(year, monthname, "01", sep = "-"))
+    ) |>
+    pivot_longer(
+      cols = c(II:Crisis), 
+      names_to = "Measure", 
+      values_to = "Numerator"
+    ) |>
+    mutate(
+      Network = "IBH",
+      Aggregation = "Practice",
+      Measure = ifelse(Measure == "II", "Initial Intake", "Crisis Stabilization"),
+      Practice = case_when(
+        Practice == "Total" ~ "IBH Network",
+        str_starts(Practice, "CHSN") ~ paste0("CHSN ", str_to_title(str_remove(Practice, "CHSN "))),
+        Practice == "Cincinnati Health Dept" ~ "Cincinnati Health Department",
+        Practice == "Liberty Sharonville Pediatrics, Inc." ~ "Liberty Sharonville Pediatrics",
+        Practice == "MONTGOMERY PEDIATRICS, INC" ~ "Montgomery Pediatrics",
+        Practice == "Crossroads" ~ "Crossroad Health Center",
+        TRUE ~ Practice
+      )
+    ) |>
+    select(Practice, Denominator:Aggregation)
+  newdata <- rbind(newdata, x)
+}
+
+denoms <- anti_join(aeu, newdata, join_by(Practice, Measure, Month)) |>
+  rbind(newdata) |>
+  filter(Measure == "Initial Intake") |>
+  select(Practice, Month, Denominator)
+
+#BMCP & Psych crisis
+
+patientbos <- dbGetQuery(con, "
+  SELECT DISTINCT sv.PatientDurableKey
+      						,sv.NumericResponse AS PatientBOS
+      						,dd1.DateValue AS BOS1Date
+      						,prd.ProviderEpicID AS BOS1Prov
+      						,sv.ResponseTimeKey
+      						,ac.SBFlag
+    FROM caboodle.dbo.SurveyAnswerFact sv
+				JOIN caboodle.dbo.DateDim dd1
+					ON sv.EncounterDateKey = dd1.DateKey
+        JOIN caboodle.dbo.EncounterFact ef
+					ON sv.EncounterKey = ef.EncounterKey
+				JOIN caboodle.dbo.ProviderDim prd
+					ON ef.ProviderDurableKey = prd.DurableKey
+				LEFT JOIN AndersonCenter.dbo.PINQProvPsychiatry ac 
+				  ON  prd.Providerepicid=ac.providerepicid
+		WHERE sv.SurveyQuestionKey = 24552
+			AND sv.Valid = 1
+			AND sv.count > 0
+  ") |>
+  mutate(
+    Practice = case_when(
+      BOS1Prov %in% bmcpprov ~ "BMCP",
+      !is.na(SBFlag) ~ "Psychiatry"
+    )
+  ) |>
+  filter(!is.na(Practice)) |>
+  group_by(PatientDurableKey, Practice, BOS1Date) |>
+  filter(ResponseTimeKey == max(ResponseTimeKey)) |>
+  ungroup() 
+
+firstbos <- patientbos |>
+  group_by(PatientDurableKey, Practice) |>
+  filter(BOS1Date == min(BOS1Date)) |>
+  ungroup()
+
+crisis <- dbGetQuery(con, "
+    SELECT DISTINCT ef.PatientDurableKey
+            				,PrimaryMRN
+            				,ef.EncounterEpicCSN
+            				,ef.EncounterKey
+            				,SUM(BillingProcedureQuantity) AS CPTQty
+            				,ef.ProviderDurableKey
+            				,btf.BillingProcedureCode AS CPTCode
+            				,prvd.ProviderEpicID
+            				,prvd.Name AS ProviderName
+            				,dad.DateValue AS EncDate
+            				,ef.VisitTypeKey
+            				,ac.SBFlag
+            				,ac.NPI
+            				,ef.DepartmentKey
+      FROM caboodle.dbo.EncounterFact ef
+    		JOIN caboodle.dbo.BillingTransactionFact btf
+    			ON btf.EncounterKey = ef.EncounterKey
+    		JOIN caboodle.dbo.PatientDim pd
+    			ON pd.DurableKey = ef.PatientDurableKey
+    		JOIN caboodle.dbo.DateDim dad
+    			ON ef.DateKey = dad.DateKey
+    		JOIN caboodle.dbo.ProviderDim prvd
+    			ON ef.ProviderDurableKey = prvd.DurableKey
+    		LEFT JOIN AndersonCenter.dbo.PINQProvPsychiatry ac
+  			  ON prvd.ProviderEpicID = ac.ProviderEpicID
+      WHERE prvd.StartDate <= dad.DateValue
+			   AND prvd.EndDate >= dad.DateValue
+			   AND btf.BillingProcedureCode IN ('90839', 'S9485')
+         AND ReportingTransactionType = 'charge'
+         AND IsInactive = 0
+      	 AND ef.EncounterKey > 0
+      	 AND pd.IsCurrent = 1
+      	 AND dad.DateValue >= '10/1/22'
+      GROUP BY ef.patientdurablekey
+        			,PrimaryMRN
+        			,ef.EncounterEpicCSN
+        			,ef.EncounterKey
+        			,ef.ProviderDurableKey
+        			,btf.BillingProcedureCode
+        			,prvd.ProviderEpicID
+        			,prvd.Name
+        			,dad.DateValue
+        			,ef.VisitTypeKey
+        			,ac.SBFlag
+        			,ac.NPI
+        			,ef.DepartmentKey
+    ") |>
+  mutate(
+    Practice = case_when(
+      ProviderEpicID %in% bmcpprov ~ "BMCP",
+      !is.na(SBFlag) &
+      !VisitTypeKey %in% c("1536", "3113", "3670", "4246", "6024", "6749", "7333") &
+        ((SBFlag == 1 & DepartmentKey == 968) | SBFlag == 0) &
+        ((NPI == "1518017102" & EncDate < "2024-03-09") | NPI != "1518017102") ~
+        "Psychiatry"
+    )
+  ) |>
+  filter(!is.na(Practice)) |>
+  mutate(Month = floor_date(EncDate, "month")) |>
+  inner_join(firstbos) |>
+  filter(
+    Month >= "2022-10-01",
+    EncDate > BOS1Date
+  ) |>
+  group_by(Month, Practice) |>
+  reframe(Numerator = length(unique(EncounterKey))) |>
+  mutate(
+    Measure = "Crisis Stabilization",
+    Network = "PINQ BH",
+    Aggregation = "Practice"
+  ) 
+
+#BMCP initial intake
+
+intake2 <- dbGetQuery(con, "
+  SELECT DISTINCT ef.patientdurablekey
+          				,PrimaryMRN
+          				,ef.EncounterEpicCSN
+          				,ef.EncounterKey
+          				,SUM(BillingProcedureQuantity) AS CPTQty
+          				,ef.ProviderDurableKey
+          				,btf.BillingProcedureCode AS CPTCode
+          				,prvd.ProviderEpicID AS ProviderEpicID
+          				,prvd.Name AS ProviderName
+          				,dad.DateValue AS EncDate
+          				,ef.VisitTypeKey
+          				,ac.NPI
+          				,ac.SBFlag
+          				,ef.DepartmentKey
+    FROM caboodle.dbo.EncounterFact ef
+  		JOIN caboodle.dbo.BillingTransactionFact btf
+  			ON btf.EncounterKey = ef.EncounterKey
+  		JOIN caboodle.dbo.PatientDim pd
+  			ON pd.DurableKey = ef.PatientDurableKey
+  		JOIN caboodle.dbo.DateDim dad
+  			ON ef.DateKey = dad.DateKey
+  		JOIN caboodle.dbo.ProviderDim prvd
+  			ON ef.ProviderDurableKey = prvd.DurableKey
+  		LEFT JOIN AndersonCenter.dbo.PinqProvPsychiatry ac
+  		  ON prvd.ProviderEpicID = ac.ProviderEpicID
+  	WHERE prvd.StartDate <= dad.DateValue
+			AND prvd.EndDate >= dad.DateValue
+			AND btf.BillingProcedureCode = '90791'
+  		AND ReportingTransactionType = 'charge'
+  		AND IsInactive = 0
+  		AND ef.EncounterKey > 0
+  		AND pd.IsCurrent=1
+  		AND dad.DateValue >= '10/1/22'
+  	GROUP BY ef.patientdurablekey
+      			,PrimaryMRN
+      			,ef.EncounterEpicCSN
+      			,ef.EncounterKey
+      			,ef.ProviderDurableKey
+      			,btf.BillingProcedureCode
+      			,prvd.ProviderEpicID
+      			,prvd.Name
+      			,dad.DateValue
+      			,dateadd(month, datediff(month, 0, dad.datevalue), 0)
+      			,ef.VisitTypeKey
+      			,ac.NPI
+      			,ac.SBFlag
+      			,ef.DepartmentKey
+    ") |>
+  mutate(
+    Practice = case_when(
+      ProviderEpicID %in% bmcpprov ~ "BMCP",
+      !is.na(SBFlag) &
+        !VisitTypeKey %in% c("1536", "3113", "3670", "4246", "6024", "6749", "7333") &
+        ((SBFlag == 1 & DepartmentKey == 968) | SBFlag == 0) &
+        ((NPI == "1518017102" & EncDate < "2024-03-09") | NPI != "1518017102") ~
+        "Psychiatry"
+    ),
+    Month = floor_date(EncDate, "month")
+  ) |>
+  filter(!is.na(Practice))
+
+crisisii <- intake2 |>
+  filter(
+    Month >= "2022-10-01",
+    CPTQty > 0
+  ) |>
+  group_by(Month, Practice) |>
+  reframe(Numerator = length(unique(EncounterEpicCSN))) |>
+  mutate(
+    Measure = "Initial Intake",
+    Network = "PINQ BH",
+    Aggregation = "Practice"
+  ) |>
+  mutate(Month = as.Date(Month)) |>
+  rbind(crisis) |>
+  left_join(denoms)
+
 #Patient-level BOS
 
 bosbooks <- workbooks[
@@ -211,7 +497,9 @@ bos <- function(workbook){
   }
   x
 }
-  
+
+setwd("C:/Users/FLI6SH/OneDrive - cchmc/Documents/Behavioral Health/PINQ/PINQ-Dashboard/Data downloads")
+
 for(j in 1:length(bosbooks)){
   newdata <- rbind(newdata, bos(bosbooks[j]))
 }
@@ -355,14 +643,6 @@ catalystbos <- finalpatientlevel |>
     Network = "PINQ BH",
     Aggregation = "Practice"
   ) 
-
-# newdata <- rbind(newdata, catalystbos) |>
-#   filter(!is.na(Denominator))
-
-denoms <- anti_join(aeu, newdata, join_by(Practice, Measure, Month)) |>
-  rbind(newdata) |>
-  filter(Measure == "Initial Intake") |>
-  select(Practice, Month, Denominator)
 
 #BMCP & IBH BOS
 
@@ -894,7 +1174,7 @@ proboslines <- probos |>
   mutate(
     Measure = "PRO BOS",
     Network = ifelse(Practice == "Community IBH", "IBH", "PINQ BH"),
-    Aggregation = ifelse(Network == "PINQ BH", "Practice", "Network")
+    Aggregation = "Practice"
   )
 
 #Psychiatry BOS
@@ -1483,319 +1763,6 @@ psychboslines <- psychbos |>
     Aggregation = "Practice"
   )
 
-#BMCP initial intake
-
-intake2 <- dbGetQuery(con, "
-  SELECT DISTINCT ef.patientdurablekey
-          				,PrimaryMRN
-          				,ef.EncounterEpicCSN
-          				,ef.EncounterKey
-          				,SUM(BillingProcedureQuantity) AS CPTQty
-          				,ef.ProviderDurableKey
-          				,btf.BillingProcedureCode AS CPTCode
-          				,prvd.ProviderEpicID AS ProviderEpicID
-          				,prvd.Name AS ProviderName
-          				,dad.DateValue AS EncDate
-    FROM caboodle.dbo.EncounterFact ef
-  		JOIN caboodle.dbo.BillingTransactionFact btf
-  			ON btf.EncounterKey = ef.EncounterKey
-  		JOIN caboodle.dbo.PatientDim pd
-  			ON pd.DurableKey = ef.PatientDurableKey
-  		JOIN caboodle.dbo.DateDim dad
-  			ON ef.DateKey = dad.DateKey
-  		JOIN caboodle.dbo.ProviderDim prvd
-  			ON ef.ProviderDurableKey = prvd.DurableKey
-  		LEFT JOIN AndersonCenter.dbo.PinqProvPsychiatry ac
-  		  ON prvd.ProviderEpicID = ac.ProviderEpicID
-  	WHERE prvd.StartDate <= dad.DateValue
-			AND prvd.EndDate >= dad.DateValue
-			AND btf.BillingProcedureCode = '90791'
-  		AND ReportingTransactionType = 'charge'
-  		AND IsInactive = 0
-  		AND ef.EncounterKey > 0
-  		AND pd.IsCurrent=1
-  		AND dad.DateValue >= '10/1/22'
-  	GROUP BY ef.patientdurablekey
-      			,PrimaryMRN
-      			,ef.EncounterEpicCSN
-      			,ef.EncounterKey
-      			,ef.ProviderDurableKey
-      			,btf.BillingProcedureCode
-      			,prvd.ProviderEpicID
-      			,prvd.Name
-      			,dad.DateValue
-      			,dateadd(month, datediff(month, 0, dad.datevalue), 0)
-    ") |>
-  filter(ProviderEpicID %in% bmcpprov) |>
-  mutate(Month = floor_date(EncDate, "month"))
-
-bmcpii <- intake2 |>
-  filter(
-    Month >= "2022-10-01",
-    CPTQty > 0
-  ) |>
-  group_by(Month) |>
-  reframe(Numerator = length(unique(EncounterEpicCSN))) |>
-  mutate(
-    Practice = "BMCP",
-    Measure = "Initial Intake",
-    Network = "PINQ BH",
-    Aggregation = "Practice"
-  ) |>
-  inner_join(denoms) |>
-  mutate(Month = as.Date(Month))
-
-#Psychiatry initial intake
-
-intake2 <- dbGetQuery(con, "
-  SELECT DISTINCT ef.PatientDurableKey
-          	  		,PrimaryMRN
-          				,ef.EncounterEpicCSN
-          				,ef.EncounterKey
-          				,SUM(BillingProcedureQuantity) AS CPTQty
-          				,ef.ProviderDurableKey
-          				,btf.BillingProcedureCode AS CPTCode
-          				,prvd.ProviderEpicID AS ProviderEpicID
-          				,prvd.Name AS ProviderName
-          				,dad.DateValue AS EncDate
-	FROM caboodle.dbo.EncounterFact ef
-		JOIN caboodle.dbo.BillingTransactionFact btf
-			ON btf.EncounterKey = ef.EncounterKey
-		JOIN caboodle.dbo.PatientDim pd
-			ON pd.DurableKey = ef.PatientDurableKey
-		JOIN caboodle.dbo.DateDim dad
-			ON ef.DateKey = dad.DateKey
-		JOIN caboodle.dbo.ProviderDim prvd
-			ON ef.ProviderDurableKey = prvd.DurableKey
-		JOIN AndersonCenter.dbo.PINQProvPsychiatry ac
-			ON prvd.ProviderEpicID = ac.ProviderEpicID
-	WHERE (
-	  CASE WHEN SBFlag = 1 AND ef.DepartmentKey = 968 THEN 1
-			WHEN SBFlag = 0 THEN 1
-			ELSE 0 END = 1
-				)
-		AND (
-		  CASE WHEN ac.npi = '1518017102' AND dad.DateValue < '3/9/24' THEN 1
-				WHEN ac.npi <> '1518017102' THEN 1
-				ELSE 0 END = 1
-				)
-		AND prvd.StartDate <= dad.DateValue
-		AND prvd.EndDate >= dad.DateValue
-		AND btf.BillingProcedureCode = '90791'
-		AND ReportingTransactionType = 'charge'
-		AND IsInactive = 0
-		AND ef.EncounterKey > 0
-		AND pd.IsCurrent = 1
-		AND dad.DateValue >= '10/1/22'
-		AND VisitTypeKey NOT IN ('1536','3113','3670','4246','6024','6749','7333')
-	GROUP BY ef.patientdurablekey
-    			,PrimaryMRN
-    			,ef.EncounterEpicCSN
-    			,ef.EncounterKey
-    			,ef.ProviderDurableKey
-    			,btf.BillingProcedureCode
-    			,prvd.ProviderEpicID
-    			,prvd.Name
-    			,dad.DateValue
-    ") |>
-  mutate(Month = floor_date(EncDate, "month"))
-
-psychii <- intake2 |>
-  filter(
-    Month >= "2022-10-01",
-    CPTQty > 0
-  ) |>
-  group_by(Month) |>
-  reframe(Numerator = length(unique(EncounterEpicCSN))) |>
-  mutate(
-    Practice = "Psychiatry",
-    Measure = "Initial Intake",
-    Network = "PINQ BH",
-    Aggregation = "Practice"
-    ) |>
-  inner_join(denoms)
-
-#BMCP crisis
-
-patientbos <- dbGetQuery(con, "
-  SELECT DISTINCT sv.PatientDurableKey
-      						,sv.NumericResponse AS PatientBOS
-      						,dd1.DateValue AS BOS1Date
-      						,prd.ProviderEpicID AS BOS1Prov
-      						,sv.ResponseTimeKey
-    FROM caboodle.dbo.SurveyAnswerFact sv
-				JOIN caboodle.dbo.DateDim dd1
-					ON sv.EncounterDateKey = dd1.DateKey
-        JOIN caboodle.dbo.EncounterFact ef
-					ON sv.EncounterKey = ef.EncounterKey
-				JOIN caboodle.dbo.ProviderDim prd
-					ON ef.ProviderDurableKey = prd.DurableKey
-		WHERE sv.SurveyQuestionKey = 24552
-			AND sv.Valid = 1
-			AND sv.count > 0
-  ") |>
-  filter(BOS1Prov %in% bmcpprov) |>
-  group_by(PatientDurableKey, BOS1Date) |>
-  filter(ResponseTimeKey == max(ResponseTimeKey)) |>
-  ungroup()
-
-firstbos <- patientbos |>
-  group_by(PatientDurableKey) |>
-  filter(BOS1Date == min(BOS1Date)) |>
-  ungroup()
-
-crisis <- dbGetQuery(con, "
-    SELECT DISTINCT ef.PatientDurableKey
-            				,PrimaryMRN
-            				,ef.EncounterEpicCSN
-            				,ef.EncounterKey
-            				,SUM(BillingProcedureQuantity) AS CPTQty
-            				,ef.ProviderDurableKey
-            				,btf.BillingProcedureCode AS CPTCode
-            				,prvd.ProviderEpicID
-            				,prvd.Name AS ProviderName
-            				,dad.DateValue AS EncDate
-      FROM caboodle.dbo.EncounterFact ef
-    		JOIN caboodle.dbo.BillingTransactionFact btf
-    			ON btf.EncounterKey = ef.EncounterKey
-    		JOIN caboodle.dbo.PatientDim pd
-    			ON pd.DurableKey = ef.PatientDurableKey
-    		JOIN caboodle.dbo.DateDim dad
-    			ON ef.DateKey = dad.DateKey
-    		JOIN caboodle.dbo.ProviderDim prvd
-    			ON ef.ProviderDurableKey = prvd.DurableKey
-      WHERE prvd.StartDate <= dad.DateValue
-			   AND prvd.EndDate >= dad.DateValue
-			   AND btf.BillingProcedureCode IN ('90839', 'S9485')
-         AND ReportingTransactionType = 'charge'
-         AND IsInactive = 0
-      	 AND ef.EncounterKey > 0
-      	 AND pd.IsCurrent = 1
-      	 AND dad.DateValue >= '10/1/22'
-      GROUP BY ef.patientdurablekey
-        			,PrimaryMRN
-        			,ef.EncounterEpicCSN
-        			,ef.EncounterKey
-        			,ef.ProviderDurableKey
-        			,btf.BillingProcedureCode
-        			,prvd.ProviderEpicID
-        			,prvd.Name
-        			,dad.DateValue
-    ") |>
-  filter(ProviderEpicID %in% bmcpprov) |>
-  mutate(Month = floor_date(EncDate, "month"))
-
-bmcpcrisis <- inner_join(firstbos, crisis) |>
-  filter(
-    Month >= "2022-10-01",
-    EncDate > BOS1Date
-  ) |>
-  group_by(Month) |>
-  reframe(Numerator = length(unique(EncounterKey))) |>
-  mutate(
-    Practice = "BMCP",
-    Measure = "Crisis Stabilization",
-    Network = "PINQ BH",
-    Aggregation = "Practice"
-  ) |>
-  inner_join(denoms) 
-
-#Psychiatry crisis
-
-patientbos <- dbGetQuery(con, "
-  SELECT DISTINCT sv.PatientDurableKey
-      						,sv.NumericResponse AS PatientBOS
-      						,dd1.DateValue AS BOS1Date
-      						,prd.ProviderEpicID AS BOS1Prov
-      						,sv.ResponseTimeKey
-    FROM caboodle.dbo.SurveyAnswerFact sv
-      JOIN caboodle.dbo.DateDim dd1
-				ON sv.EncounterDateKey = dd1.DateKey
-      JOIN caboodle.dbo.EncounterFact ef
-				ON sv.EncounterKey = ef.EncounterKey
-      JOIN caboodle.dbo.ProviderDim prd
-				ON ef.ProviderDurableKey = prd.DurableKey
-			JOIN AndersonCenter.dbo.PINQProvPsychiatry ac
-				ON  prd.ProviderEpicID = ac.ProviderEpicID
-		WHERE sv.SurveyQuestionKey = 24552
-			AND sv.Valid = 1
-			AND sv.Count > 0
-    ") |>
-  group_by(PatientDurableKey, BOS1Date) |>
-  filter(ResponseTimeKey == max(ResponseTimeKey)) |>
-  ungroup()
-
-firstbos <- patientbos |>
-  group_by(PatientDurableKey) |>
-  filter(BOS1Date == min(BOS1Date)) |>
-  ungroup()
-
-crisis <- dbGetQuery(con, "
-  SELECT DISTINCT ef.PatientDurableKey
-          				,PrimaryMRN
-          				,ef.EncounterEpicCSN
-          				,ef.EncounterKey
-          				,SUM(BillingProcedureQuantity) AS CPTQty
-          				,ef.ProviderDurableKey
-          				,btf.BillingProcedureCode AS CPTCode
-          				,prvd.ProviderEpicID AS ProviderEpicID
-          				,prvd.Name AS ProviderName
-          				,dad.DateValue AS EncDate
-    FROM caboodle.dbo.encounterfact ef
-  		JOIN caboodle.dbo.BillingTransactionFact btf
-  			ON btf.EncounterKey = ef.EncounterKey
-  		JOIN caboodle.dbo.PatientDim pd
-  			ON pd.DurableKey = ef.PatientDurableKey
-  		JOIN caboodle.dbo.DateDim dad
-  			ON ef.DateKey = dad.DateKey
-  		JOIN caboodle.dbo.ProviderDim prvd
-  			ON ef.ProviderDurableKey = prvd.DurableKey
-  		JOIN AndersonCenter.dbo.PINQProvPsychiatry ac
-  			ON prvd.ProviderEpicID = ac.ProviderEpicID
-  	WHERE (
-    		CASE WHEN SBFlag = 1 AND ef.DepartmentKey = 968 THEN 1
-  			WHEN SBFlag = 0 THEN 1
-  			ELSE 0 END = 1
-  			)
-		  AND (
-			  CASE WHEN ac.npi = '1518017102' AND dad.DateValue < '3/9/24' THEN 1
-				  WHEN ac.npi <> '1518017102' THEN 1 ELSE 0 END = 1
-				  )
-    		AND prvd.StartDate <= dad.DateValue
-    		AND prvd.EndDate >= dad.DateValue
-    		AND btf.BillingProcedureCode in ('90839','S9485')
-    		AND ReportingTransactionType = 'charge'
-    		AND IsInactive = 0
-    		AND ef.EncounterKey > 0
-    		AND pd.IsCurrent = 1
-    		AND dad.DateValue >= '10/1/22'
-    		AND VisitTypeKey NOT IN ('1536','3113','3670','4246','6024','6749','7333')
-    GROUP BY ef.PatientDurableKey
-      			,PrimaryMRN
-      			,ef.EncounterEpicCSN
-      			,ef.EncounterKey
-      			,ef.ProviderDurableKey
-      			,btf.BillingProcedureCode
-      			,prvd.ProviderEpicID
-      			,prvd.Name
-      			,dad.DateValue
-      ") |>
-  mutate(Month = floor_date(EncDate, "month"))
-
-psychcrisis <- inner_join(firstbos, crisis) |>
-  filter(
-    Month >= "2022-10-01",
-    EncDate > BOS1Date
-  ) |>
-  group_by(Month) |>
-  reframe(Numerator = length(unique(EncounterKey))) |>
-  mutate(
-    Practice = "Psychiatry",
-    Measure = "Crisis Stabilization",
-    Network = "PINQ BH",
-    Aggregation = "Practice"
-  ) |>
-  inner_join(denoms) 
 
 # pinq <- filter(alldata2, Network == "PINQ BH") |>
 #   group_by(Measure, Month, Network) |>
@@ -1844,6 +1811,14 @@ oldsite <- read_excel(
 ) |>
   mutate(
     Aggregation = "Practice",
+    Practice = case_when(
+      Practice == "BEST POINT" ~ "Best Point",
+      Practice == "Englender, Sper & Drasnin, MDs, Inc. - Provider" ~ "ESD Pediatrics",
+      Practice == "NEWPATH" ~ "NewPath",
+      Practice == "BUTLER BH" ~ "Butler BH",
+      Practice == "CHSN Rockdale SBHC" ~ "CHSN Rockdale Primary Care",
+      TRUE ~ Practice
+      ),
     Measure = ifelse(Measure == "IP Admissions", "Inpatient Admissions", Measure)
     )
 
@@ -1890,7 +1865,8 @@ oldpinq <- read_excel(
       "Inpatient Admissions"
     ),
     Network = "PINQ BH",
-    Aggregation = "Network"
+    Aggregation = "Network",
+    Practice = "PINQ BH Network"
   )
 # 
 # newsite <- read_excel("utilization.xlsx", sheet =  "practice")
@@ -3071,7 +3047,7 @@ denom3 <- dbGetQuery(con, "
           					WHEN PrimaryDepartmentEpicID = '20020540' THEN 'CHSN Batesville Primary Care'
           					WHEN PrimaryDepartmentEpicID IN ('20060540','20059540','20058540') THEN 'MLS'
           					WHEN PrimaryDepartmentEpicID = '20080540' THEN 'CHSN Kenwood Crossing Primary Care'
-          					WHEN PrimaryDepartmentEpicID IN ('20001410','20067540') THEN 'CHSN Rockdale SBHC'
+          					WHEN PrimaryDepartmentEpicID IN ('20001410','20067540') THEN 'CHSN Rockdale Primary Care'
           					WHEN PrimaryDepartmentEpicID IN ('20096540') THEN 'CHSN Wilmington Primary Care'
           					END AS Practice
           				,c.EndDateKey
@@ -3311,8 +3287,13 @@ ipagg <- inner_join(denomagg, admits) |>
 ibhpracticeute <- rbind(edagg, ipagg) |>
   mutate(
     Network = "IBH",
-    Aggregation = "Practice"
-  )
+    Aggregation = "Practice",
+    Practice = ifelse(
+      Practice == "Englender, Sper & Drasnin, MDs, Inc. - Provider", 
+      "ESD Pediatrics",
+      Practice
+      )
+  ) 
 
 ibhutefinal <- edagg |>
   group_by(Month, Measure) |>
@@ -3443,36 +3424,40 @@ ibhutefinal <- edagg |>
 
 alldata <- anti_join(aeu, newdata, join_by(Practice, Measure, Month)) |>
   rbind(newdata) |>
-  anti_join(bmcpcrisis, join_by(Practice, Measure, Month)) |>
-  anti_join(bmcpii, join_by(Practice, Measure, Month)) |>
+  anti_join(crisisii, join_by(Practice, Measure, Month)) |>
   anti_join(proboslines, join_by(Practice, Measure, Month)) |>
-  anti_join(psychii, join_by(Practice, Measure, Month)) |>
   anti_join(psychboslines, join_by(Practice, Measure, Month)) |>
   anti_join(catalystbos, join_by(Practice, Measure, Month)) |>
-  rbind(oldsite) |>
-  rbind(oldibh) |>
-  rbind(oldpinq) |>
   rbind(catalystbos) |>
   rbind(proboslines) |>
   rbind(psychboslines) |>
-  rbind(bmcpii) |>
-  rbind(psychii) |>
-  rbind(bmcpcrisis) |>
+  rbind(crisisii) |>
+  rbind(oldsite) |>
+  rbind(oldibh) |>
+  rbind(oldpinq) |>
+  anti_join(pinqutepracticefinal, join_by(Practice, Measure, Month)) |>
   rbind(pinqutepracticefinal) |>
+  anti_join(pinqutenetworkfinal, join_by(Practice, Measure, Month)) |>
   rbind(pinqutenetworkfinal) |>
+  anti_join(ibhpracticeute, join_by(Practice, Measure, Month)) |>
   rbind(ibhpracticeute) |>
+  anti_join(ibhutefinal, join_by(Practice, Measure, Month)) |>
   rbind(ibhutefinal) |>
-  ungroup() |>
-  mutate(
-    Practice = case_when(
-      Practice == "BEST POINT" ~ "Best Point",
-      Practice == "BUTLER BH" ~ "Butler BH",
-      Practice == "NEWPATH" ~ "NewPath",
-      TRUE ~ Practice
+  mutate(Numerator = coalesce(Numerator, 0)) |>
+  filter(
+    Month >= "2022-01-01",
+    !is.na(Denominator),
+    Denominator > .00001,
+    Month < floor_date(today() - 15, "month")
     )
-  )
 
-pinq <- filter(alldata, Network == "PINQ BH", Aggregation == "Practice") |> 
+pinq <- alldata |>
+  filter(
+    Network == "PINQ BH", 
+    Aggregation == "Practice",
+    Practice != "PINQ BH Network",
+    !Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions")
+  ) |> 
   group_by(Measure, Month, Network) |>
   reframe(
     Numerator = sum(Numerator),
@@ -3481,13 +3466,49 @@ pinq <- filter(alldata, Network == "PINQ BH", Aggregation == "Practice") |>
   mutate(
     Practice = "PINQ BH Network",
     Aggregation = "Network"
-    )
+  )
 
-alldata2 <- rbind(alldata, pinq) |>
-  filter(
-    Month > "2021-12-31",
-    Month < today() - 30
-    ) |>
+alldata2 <- filter(
+  alldata, 
+  Measure %in% c("Crisis Stabilization", "Initial Intake")
+  ) |>
+  group_by(Practice, Measure) |>
+  reframe(
+    FirstMonth = min(Month),
+    LastMonth = max(Month)
+  ) |>
+  inner_join(
+    dateframe, 
+    join_by(Practice, Measure, FirstMonth <= Month, LastMonth >= Month)
+  ) |>
+  distinct(Practice, Measure, Month) |>
+  left_join(alldata) |>
+  filter(is.na(Denominator)) |>
+  group_by(Practice, Measure) |>
+  mutate(
+    FirstMonth = as.Date(min(Month)),
+    LastMonth = as.Date(max(Month)),
+    FirstMonth = floor_date(FirstMonth - 1, "month"),
+    LastMonth = floor_date(LastMonth + 35, "month")
+  ) |>
+  select(Practice, Measure, Month, FirstMonth, LastMonth) |>
+  inner_join(
+    select(alldata, Practice, Measure, Month, Denominator1 = Denominator),
+    join_by(Practice, Measure, FirstMonth == Month)
+  ) |>
+  inner_join(
+    select(alldata, Practice, Measure, Month, Denominator2 = Denominator),
+    join_by(Practice, Measure, LastMonth == Month)
+  ) |>
+  mutate(Denominator = (Denominator1 + Denominator2) / 2) |>
+  select(Practice, Measure, Month, Denominator) |>
+  mutate(
+    Numerator = 0,
+    Aggregation = "Practice"
+  ) |>
+  inner_join(alldata |> distinct(Practice, Network)) |>
+  rbind(alldata) |>
+  rbind(pinq) |>
   mutate(
     Season = case_when(
       !Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions") ~ "None",
@@ -3495,12 +3516,13 @@ alldata2 <- rbind(alldata, pinq) |>
       TRUE ~ "Break"
     )
   ) |>
-  arrange(Practice, Measure, Network, Aggregation, Season, Month) |>
-  group_by(Practice, Measure, Network, Season, Aggregation) |>
+  arrange(Practice, Measure, Month) |>
+  group_by(Practice, Measure) |>
+  mutate(rn = row_number()) |>
+  group_by(Practice, Measure, Season) |>
   mutate(
-    rn = row_number(),
-    BaseDenom = sum(Denominator[rn <= 12]),
-    BaseNumerator = sum(Numerator[rn <= 12]),
+    BaseDenom = sum(Denominator[rn <= 24]),
+    BaseNumerator = sum(Numerator[rn <= 24]),
     Centerline = ifelse(
       Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
       BaseNumerator * 10000 / BaseDenom,
@@ -3512,13 +3534,13 @@ alldata2 <- rbind(alldata, pinq) |>
       Numerator / Denominator
     ),
     xlab = paste0(
-      str_trunc(year(Month), 2, "right", ellipsis = ""),
+      str_trunc(year(Month), 2, "left", ellipsis = ""),
       "-",
       monthlabs[month(Month)],
       " (n = ",
       format(round(Denominator, 0), big.mark = ","),
       ")"
-      ),
+    ),
     UCL = ifelse(
       Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
       Centerline + (3 * sqrt((10000 * Centerline) / Denominator)),
@@ -3529,96 +3551,52 @@ alldata2 <- rbind(alldata, pinq) |>
       Centerline - (3 * sqrt((10000 * Centerline) / Denominator)),
       Centerline - (3 * sqrt(Centerline / Denominator))
     ),
-    LCL = ifelse(LCL < 0, 0, LCL)
-  )
+    LCL = ifelse(LCL < 0, 0, LCL),
+    UCL = ifelse(Measure == "PRO BOS" & UCL > 1, 1, UCL)
+  ) 
 
-shifts <- filter(alldata2, rn > 12) |>
+shifts <- filter(alldata2, rn > 24) |>
+  arrange(Practice, Measure, Month) |>
+  group_by(Practice, Measure) |>
   mutate(maxrn = max(rn)) |>
   ungroup() |>
-  filter(maxrn >= 20) |>
+  filter(maxrn >= 32) |>
   mutate(
     Above = ifelse(Rate > Centerline, "Y", "N"),
     RLEVal = paste0(Practice, Measure, Above)
-    ) |>
-  arrange(Practice, Measure, Month) 
+    ) 
   
 shiftrle <- rle(shifts$RLEVal)
 shiftlabs <- 1:shiftrle$lengths[1]
+shiftruns <- rep(1, each = shiftrle$lengths[1])
 for (m in 2:length(shiftrle$lengths)){
   x <- 1:shiftrle$lengths[m]
+  y <- rep(m, shiftrle$lengths[m])
   shiftlabs <- c(shiftlabs, x)
+  shiftruns <- c(shiftruns, y)
 }
 
-alldata3 <- shifts |>
-  mutate(Run = shiftlabs) |>
-  group_by(Practice, Measure) |>
-  mutate(MaxRun = max(Run)) |>
-  filter(MaxRun >= 8) |>
-  group_by(Practice, Measure, Season) |>
+shifts1 <- shifts |>
   mutate(
-    rn = row_number(),
-    BaseDenom = sum(Denominator[rn <= 12]),
-    BaseNumerator = sum(Numerator[rn <= 12]),
-    Centerline = ifelse(
-      Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
-      BaseNumerator * 10000 / BaseDenom,
-      BaseNumerator / BaseDenom
-    ),
-    UCL = ifelse(
-      Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
-      Centerline + (3 * sqrt((10000 * Centerline) / Denominator)),
-      Centerline + (3 * sqrt(Centerline / Denominator))
-    ) ,
-    LCL = ifelse(
-      Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
-      Centerline - (3 * sqrt((10000 * Centerline) / Denominator)),
-      Centerline - (3 * sqrt(Centerline / Denominator))
-    ),
-    LCL = ifelse(LCL < 0, 0, LCL)
-  ) |>
-  select(rn, Centerline, UCL, LCL) |>
-  mutate(Shift = 1) |>
-  right_join(alldata2, join_by(Practice, Measure, Season, rn)) |>
-  mutate(
-    Centerline = coalesce(Centerline.x, Centerline.y),
-    UCL = coalesce(UCL.x, UCL.y),
-    LCL = coalesce(LCL.x, LCL.y),
-    Shift = coalesce(Shift, 0)
+    Run = shiftlabs,
+    RunNo = shiftruns
     ) |>
-  select(Practice:Season, Shift:Aggregation, Rate, xlab, Centerline:LCL) |>
-  arrange(Practice, Measure, Month) |>
-  group_by(Practice, Measure, Season, Shift) |>
-  mutate(rn = row_number()) |>
-  ungroup()
-
-shifts2 <- filter(alldata3, Shift == 1, rn > 12) |>
-  group_by(Practice, Measure, Season, Shift) |>
-  mutate(maxrn = max(rn)) |>
-  ungroup() |>
-  filter(maxrn >= 20) |>
-  mutate(
-    Above = ifelse(Rate > Centerline, "Y", "N"),
-    RLEVal = paste0(Practice, Measure, Above)
-  ) |>
-  arrange(Practice, Measure, Month) 
-  
-shiftrle2 <- rle(shifts2$RLEVal)
-shiftlabs2 <- 1:shiftrle2$lengths[1]
-for (p in 2:length(shiftrle2$lengths)){
-  x <- 1:shiftrle2$lengths[p]
-  shiftlabs2 <- c(shiftlabs2, x)
-}
-
-alldata4 <- shifts2 |>
-  mutate(Run = shiftlabs2) |>
-  group_by(Practice, Measure) |>
+  group_by(Practice, Measure, RunNo) |>
   mutate(MaxRun = max(Run)) |>
   filter(MaxRun >= 8) |>
+  group_by(Practice, Measure) |>
+  mutate(StartDate = min(Month[MaxRun >= 8])) |>
+  distinct(Practice, Measure, StartDate) |>
+  inner_join(alldata2) |>
+  filter(Month >= StartDate) |>
+  group_by(Practice, Measure) |>
+  mutate(rn = row_number()) |>
+  filter(rn <= 24) |>
   group_by(Practice, Measure, Season) |>
   mutate(
-    rn2 = row_number(),
-    BaseDenom = sum(Denominator[rn2 <= 12]),
-    BaseNumerator = sum(Numerator[rn2 <= 12]),
+    BaseDenom = sum(Denominator[rn <= 24]),
+    BaseNumerator = sum(Numerator[rn <= 24]),
+    ShiftPeriod = ifelse(rn <= 8, Rate, NA),
     Centerline = ifelse(
       Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
       BaseNumerator * 10000 / BaseDenom,
@@ -3634,76 +3612,461 @@ alldata4 <- shifts2 |>
       Centerline - (3 * sqrt((10000 * Centerline) / Denominator)),
       Centerline - (3 * sqrt(Centerline / Denominator))
     ),
-    LCL = ifelse(LCL < 0, 0, LCL)
+    LCL = ifelse(LCL < 0, 0, LCL),
+    UCL = ifelse(Measure == "PRO BOS" & UCL > 1, 1, UCL)
   ) |>
-  select(rn, Centerline, UCL, LCL) |>
-  mutate(Shift = 2) |>
-  right_join(alldata3, join_by(Practice, Measure, Season, rn)) |>
-  mutate(
-    Centerline = coalesce(Centerline.x, Centerline.y),
-    UCL = coalesce(UCL.x, UCL.y),
-    LCL = coalesce(LCL.x, LCL.y),
-    Shift = coalesce(Shift.x, Shift.y)
-  ) |>
-  select(Practice:Season, Month:xlab, Centerline:Shift) |> 
-  arrange(Practice, Measure, Month) |>
-  group_by(Practice, Measure, Season, Shift) |>
-  mutate(rn = row_number()) |>
-  ungroup()
-
-shifts3 <- filter(alldata4, Shift == 2, rn > 12) |>
-  group_by(Practice, Measure, Season, Shift) |>
-  mutate(maxrn = max(rn)) |>
   ungroup() |>
-  filter(maxrn >= 20) |>
-  mutate(
-    Above = ifelse(Rate > Centerline, "Y", "N"),
-    RLEVal = paste0(Practice, Measure, Above)
-  ) |>
-  arrange(Practice, Measure, Month) 
-
-shiftrle3 <- rle(shifts3$RLEVal)
-shiftlabs3 <- 1:shiftrle3$lengths[1]
-for (q in 2:length(shiftrle3$lengths)){
-  x <- 1:shiftrle3$lengths[q]
-  shiftlabs3 <- c(shiftlabs3, x)
-}
-
-alldata5 <- shifts3 |>
-  mutate(Run = shiftlabs3) |>
+  select(Practice:Month, Centerline, UCL, LCL, ShiftPeriod) |>
   group_by(Practice, Measure) |>
-  mutate(MaxRun = max(Run)) |>
-  filter(MaxRun >= 8) |>
-  group_by(Practice, Measure, Season) |>
-  mutate(
-    rn2 = row_number(),
-    BaseDenom = sum(Denominator[rn2 <= 12]),
-    BaseNumerator = sum(Numerator[rn2 <= 12]),
-    Centerline = ifelse(
-      Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
-      BaseNumerator * 10000 / BaseDenom,
-      BaseNumerator / BaseDenom
-    ),
-    UCL = ifelse(
-      Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
-      Centerline + (3 * sqrt((10000 * Centerline) / Denominator)),
-      Centerline + (3 * sqrt(Centerline / Denominator))
-    ) ,
-    LCL = ifelse(
-      Measure %in% c("ED Visits (Discharged)", "Inpatient Admissions"),
-      Centerline - (3 * sqrt((10000 * Centerline) / Denominator)),
-      Centerline - (3 * sqrt(Centerline / Denominator))
-    ),
-    LCL = ifelse(LCL < 0, 0, LCL)
-  ) |>
-  select(rn, Centerline, UCL, LCL) |>
-  mutate(Shift = 3) |>
-  right_join(alldata4, join_by(Practice, Measure, Season, rn)) |>
-  mutate(
-    Centerline = coalesce(Centerline.x, Centerline.y),
-    UCL = coalesce(UCL.x, UCL.y),
-    LCL = coalesce(LCL.x, LCL.y)
-  ) |>
-  select(Practice:Season, Month:xlab, Centerline:LCL) |> 
-  arrange(Practice, Measure, Month)
+  mutate(EndDate = max(Month))
 
+alldata3 <- left_join(alldata2, shifts1, join_by(Practice, Measure, Month)) |>
+  mutate(
+    Centerline = coalesce(Centerline.y, Centerline.x),
+    UCL = coalesce(UCL.y, UCL.x),
+    LCL = coalesce(LCL.y, LCL.x),
+    Month = as.character(Month)
+  ) |>
+  select(Practice:Season, Rate, xlab, ShiftPeriod, Centerline:LCL)
+
+write_csv(alldata3, "for powerbi.csv")
+
+#Time to goal
+
+# etx1a <- dbGetQuery(con, "
+#   SELECT DISTINCT a.PatientDurableKey
+# 					,a.EncounterKey
+# 					,a.FlowsheetValueKey
+# 					,a.Value
+# 					,a.DateKey
+# 					,a.TakenInstant
+# 					,dad.DateValue AS FlowDate
+# 					,prd.DurableKey AS ProviderDurableKey
+# 					,prd.ProviderEpicID
+# 		FROM caboodle.dbo.FlowsheetValueFact a  
+# 			JOIN caboodle.dbo.DateDim dad 
+# 				ON a.DateKey = dad.DateKey
+# 			JOIN caboodle.dbo.EncounterFact ef 
+# 				ON a.EncounterKey = ef.EncounterKey 
+# 					AND ef.Count > 0
+# 			JOIN caboodle.dbo.ProviderDim prd 
+# 				ON ef.ProviderDurableKey = prd.Durablekey 
+#     WHERE a.FlowsheetRowKey = 40093 
+# 		AND a.Value = 'End of Active Tx' 
+# 		AND a.Count > 0                   
+#   ") |>
+#   filter(ProviderEpicID %in% uteprovs) |>
+#   group_by(PatientDurableKey, DateKey) |>
+#   filter(TakenInstant == max(TakenInstant)) |>
+#   ungroup()
+# 
+# etx1b2 <- dbGetQuery(con, "
+#   SELECT DISTINCT fv.PatientDurableKey
+#     							,fv.EncounterKey
+#     							,fv.NumericValue
+#     							,fv.DateKey
+#     							,FirstDocumentedInstant
+#     							,prd.ProviderEpicID
+#     							,fv.TakenInstant
+# 				FROM caboodle.dbo.FlowsheetValueFact fv 
+# 					--join #etx1a a on a.patientdurablekey=fv.patientdurablekey 
+# 					JOIN caboodle.dbo.EncounterFact ef 
+# 						ON fv.EncounterKey = ef.EncounterKey
+# 					JOIN caboodle.dbo.ProviderDim prd 
+# 						ON ef.ProviderDurableKey = prd.DurableKey 
+# 				WHERE fv.Count > 0 
+# 					AND fv.FlowsheetRowKey = 51011                   
+#   ") |>
+#   filter(ProviderEpicID %in% uteprovs) |>
+#   group_by(PatientDurableKey, DateKey) |>
+#   filter(TakenInstant == max(TakenInstant)) |>
+#   filter(FirstDocumentedInstant == max(FirstDocumentedInstant)) |>
+#   ungroup() |>
+#   inner_join(etx1a |> distinct(PatientDurableKey))
+# 
+# etx1b3 <- dbGetQuery(con, "
+#   SELECT DISTINCT sv.PatientDurableKey
+#     							,sv.EncounterKey
+#     							,sv.NumericResponse
+#     							,sv.ResponseDateKey
+#     							,sv.ResponseTimeKey
+#     							,prd.ProviderEpicID
+# 				FROM caboodle.dbo.SurveyAnswerFact sv 
+# 					JOIN caboodle.dbo.EncounterFact ef 
+# 						ON sv.EncounterKey = ef.EncounterKey
+# 					JOIN caboodle.dbo.ProviderDim prd 
+# 						ON ef.ProviderDurableKey = prd.DurableKey 
+# 				where sv.SurveyQuestionKey = 24552 
+# 					AND sv.Valid = 1 
+# 					AND sv.Count > 0                   
+#  ") |>
+#   filter(ProviderEpicID %in% uteprovs) |>
+#   group_by(PatientDurableKey, ResponseDateKey) |>
+#   filter(ResponseTimeKey == max(ResponseTimeKey)) |>
+#   filter(EncounterKey == max(EncounterKey)) |>
+#   ungroup() |>
+#   inner_join(etx1a |> distinct(PatientDurableKey))
+# 
+# etx1b <- etx1a |>
+#   left_join(etx1b2, join_by(PatientDurableKey, DateKey)) |>
+#   left_join(etx1b3, join_by(PatientDurableKey, DateKey == ResponseDateKey)) |>
+#   mutate(TrueBOS = coalesce(NumericValue, NumericResponse)) |>
+#   rename(
+#     ProviderBOS = NumericValue,
+#     PatientBOS = NumericResponse
+#   ) |>
+#   select(PatientDurableKey:ProviderEpicID.x, ProviderBOS, PatientBOS, TrueBOS) |> 
+#   rename(
+#     EncounterKey = EncounterKey.x,
+#     TakenInstant = TakenInstant.x,
+#     ProviderEpicID = ProviderEpicID.x
+#   )
+# 
+# visit1a <- dbGetQuery(con, "
+#   SELECT DISTINCT ef.PatientDurableKey
+# 				,PrimaryMRN
+# 				,ef.EncounterEpicCSN
+# 				,ef.EncounterKey
+# 				,SUM(BillingProcedureQuantity) AS CPTQty
+# 				,ef.ProviderDurableKey
+# 				,btf.BillingProcedureCode AS CPTCode
+# 				,prvd.ProviderEpicID AS ProviderEpicID
+# 				,prvd.Name AS ProviderName
+# 				,dad.DateValue AS ProcDate
+# 				,CASE WHEN btf.BillingProcedureCode = '90791' THEN 1 ELSE 0 END AS trtstfl
+# 	FROM  caboodle.dbo.EncounterFact ef
+# 		JOIN caboodle.dbo.BillingTransactionFact btf 
+# 			ON btf.EncounterKey = ef.EncounterKey 
+# 		JOIN caboodle.dbo.PatientDim pd 
+# 			ON pd.DurableKey = ef.PatientDurableKey
+# 		JOIN caboodle.dbo.DateDim dad 
+# 			ON ef.DateKey = dad.DateKey 
+# 		JOIN caboodle.dbo.ProviderDim prvd 
+# 			ON ef.ProviderDurableKey = prvd.DurableKey 
+# 	WHERE btf.BillingProcedureCode IN (
+# 	    '90791', '90832', '90834', '90837', 
+# 	    '90846', '90847', '90839', '90840'
+# 	    )
+# 		AND prvd.StartDate <= dad.DateValue 
+# 		AND prvd.EndDate >= dad.DateValue
+# 		AND IsInactive = 0
+# 		AND ReportingTransactionType = 'charge'
+# 		AND ef.EncounterKey > 0
+# 		AND pd.IsCurrent = 1
+# 		AND dad.DateValue >= '10/1/22'
+# 	GROUP BY ef.PatientDurableKey
+# 			,PrimaryMRN
+# 			,ef.EncounterEpicCSN
+# 			,ef.EncounterKey
+# 			,ef.ProviderDurableKey
+# 			,btf.BillingProcedureCode
+# 			,prvd.ProviderEpicID 
+# 			,prvd.Name 
+# 			,dad.DateValue
+# 			,CASE WHEN btf.BillingProcedureCode = '90791' THEN 1 ELSE 0 END                    
+#    ") |>
+#   filter(
+#     ProviderEpicID %in% uteprovs,
+#     CPTQty > 0
+#     )
+# 
+# visit1b1 <- dbGetQuery(con, "
+#   SELECT DISTINCT sv.PatientDurableKey
+# 									,sv.NumericResponse AS PatientBOS
+# 									,dd1.DateValue AS BOS1Date
+# 									,sv.ResponseTimeKey
+# 									,prd.ProviderEpicID AS BOS1Prov
+# 		FROM caboodle.dbo.SurveyAnswerFact sv 
+# 			JOIN caboodle.dbo.DateDim dd1 
+# 				ON sv.EncounterDateKey = dd1.DateKey
+# 			JOIN caboodle.dbo.EncounterFact ef 
+# 				ON sv.EncounterKey = ef.EncounterKey
+# 			JOIN caboodle.dbo.ProviderDim prd 
+# 				ON ef.ProviderDurableKey = prd.durablekey 
+# 		WHERE sv.SurveyQuestionKey = 24552 
+# 			AND sv.Valid = 1 
+# 			AND sv.Count > 0                     
+#   ") |>
+#   filter(
+#     BOS1Prov %in% uteprovs,
+#     PatientDurableKey %in% visit1a$PatientDurableKey
+#     ) |>
+#   group_by(PatientDurableKey, BOS1Date) |>
+#   filter(ResponseTimeKey == max(ResponseTimeKey)) |>
+#   ungroup()
+# 
+# visit1b2 <- dbGetQuery(con, "
+#   SELECT DISTINCT fv.PatientDurableKey
+# 										,fv.NumericValue AS ProviderBOS
+# 										,dd1.DateValue AS BOS2Date
+# 										,prd.ProviderEpicID AS BOS2Prov
+# 										,fv.FirstDocumentedInstant AS pbosinst
+# 							FROM caboodle.dbo.FlowsheetValueFact fv 
+# 								JOIN caboodle.dbo.DateDim dd1 
+# 									ON fv.DateKey = dd1.DateKey
+# 								JOIN caboodle.dbo.EncounterFact ef 
+# 									ON fv.EncounterKey = ef.EncounterKey
+# 								JOIN caboodle.dbo.ProviderDim prd 
+# 									ON ef.ProviderDurableKey = prd.DurableKey 
+# 							WHERE fv.Count > 0 
+# 								AND fv.FlowsheetRowKey = 51011                     
+#   ") |>
+#   filter(
+#     BOS2Prov %in% uteprovs,
+#     PatientDurableKey %in% visit1a$PatientDurableKey
+#     ) |>
+#   group_by(PatientDurableKey, BOS2Date) |>
+#   filter(pbosinst == max(pbosinst)) |>
+#   mutate(lines = n()) |>
+#   arrange(PatientDurableKey, BOS2Date, ProviderBOS) |>
+#   mutate(rn = row_number()) |>
+#   filter(rn == 1) |>
+#   ungroup() |>
+#   select(-rn)
+# 
+# visit1b <- left_join(
+#   visit1a, 
+#   visit1b1, 
+#   join_by(PatientDurableKey, ProcDate == BOS1Date)
+#   ) |>
+#   rename(PatientBOS_Provider = BOS1Prov) |>
+#   left_join(visit1b2, join_by(PatientDurableKey, ProcDate == BOS2Date)) |>
+#   rename(ProviderBOS_Provider = BOS2Prov) |>
+#   group_by(PatientDurableKey, ProcDate) |>
+#   filter(CPTCode == max(CPTCode)) |>
+#   ungroup() |>
+#   mutate(
+#     TrueBOS = coalesce(ProviderBOS, PatientBOS),
+#     TrueBOS_Prov = ifelse(!is.na(ProviderBOS), ProviderBOS_Provider, PatientBOS_Provider)
+#   )
+#   
+# visit1c <- etx1b |>
+#   select(PatientDurableKey, Value, adt = FlowDate, ProviderEpicID, TrueBOS) |>
+#   mutate(
+#     CPTCode = "",
+#     TrueBOS_Prov = ProviderEpicID,
+#     trtstfl = 0,
+#     trtstfl = 0,
+#     trtedfl = 1,
+#     source = 2
+#   ) |>
+#   rbind(
+#     select(
+#       visit1b, 
+#       PatientDurableKey, 
+#       CPTCode, 
+#       adt = ProcDate, 
+#       ProviderEpicID, 
+#       TrueBOS, 
+#       trtstfl
+#       ) |>
+#       mutate(
+#         Value = "",
+#         TrueBOS_Prov = ProviderEpicID,
+#         trtedfl = 0,
+#         source = 1
+#       )
+#   ) |>
+#   arrange(PatientDurableKey, adt, source) |>
+#   group_by(PatientDurableKey, adt) |>
+#   mutate(prvrn = row_number()) |>
+#   ungroup()
+# 
+# visit2a <- visit1c |>
+#   mutate(TrueBOS = coalesce(TrueBOS, -1)) |>
+#   group_by(PatientDurableKey, adt) |>
+#   reframe(
+#     TrueBOS = max(TrueBOS),
+#     Value = max(Value),
+#     CPTCode = max(CPTCode),
+#     trtstfl = max(trtstfl),
+#     trtedfl = max(trtedfl)
+#   )
+# 
+# visit2b <- filter(visit1c, prvrn == 1) |>
+#   distinct(PatientDurableKey, adt, ProviderEpicID)
+# 
+# visit2 <- left_join(visit2a, visit2b) |>
+#   arrange(PatientDurableKey, adt) |>
+#   group_by(PatientDurableKey) |>
+#   mutate(
+#     CheckLastEnd = lag(trtedfl, 1),
+#     TrueBOS = ifelse(TrueBOS == -1, NA, TrueBOS),
+#     trtstfl = ifelse(trtstfl == 0 & trtedfl == 0 & CheckLastEnd == 1, 1.1, trtstfl)
+#     ) |>
+#   ungroup()
+# 
+# starts <- filter(visit2, trtstfl > 0) |>
+#   select(PatientDurableKey, trtsdt = adt, StartProv = ProviderEpicID, trtstfl) |>
+#   unique()
+# 
+# ends <- filter(visit2, trtedfl == 1) |>
+#   select(PatientDurableKey, trtedt = adt, EndProv = ProviderEpicID, trtedfl)
+# 
+# course0 <- left_join(
+#   starts, 
+#   ends, 
+#   join_by(PatientDurableKey, trtsdt < trtedt)
+#   ) 
+#   filter(trtsdt < trtedt | is.na(trtedt)) |>
+#   arrange(PatientDurableKey, trtsdt)
+#   
+# course1 <- course0 |>
+#   filter(!is.na(trtedt)) |>
+#   group_by(PatientDurableKey, trtedt) |>
+#   filter(trtsdt == max(trtsdt)) |>
+#   rbind(filter(course0, is.na(trtedt))) |>
+#   arrange(PatientDurableKey, trtsdt, trtedt) |>
+#   group_by(PatientDurableKey, trtsdt) |>
+#   mutate(
+#     NextEnd = lead(trtedt, 1),
+#     LastEnd = lag(trtedt, 1),
+#     srn = row_number(),
+#     FirstEnd = trtedt[srn == 1],
+#     NewStart = FirstEnd + 90,
+#     fetxgap = as.numeric(trtedt - FirstEnd),
+#     netxgap = as.numeric(NextEnd - trtedt),
+#     letxgap = as.numeric(trtedt - LastEnd)
+#   ) |>
+#   ungroup()
+#   
+# course2a <- course1 |>
+#   filter(
+#     !is.na(fetxgap),
+#     fetxgap < 90
+#   ) |>
+#   group_by(PatientDurableKey, trtsdt) |>
+#   filter(srn == max(srn)) |>
+#   select(PatientDurableKey, trtsdt, StartProv, trtedt, EndProv, trtstfl, trtedfl)
+# 
+# course2b <- course1 |>
+#   filter(
+#     !is.na(fetxgap),
+#     fetxgap >= 90
+#     ) |>
+#   mutate(
+#     trtsdt = case_when(
+#       srn > 2 & letxgap >= 90 ~ LastEnd + 1,
+#       TRUE ~ NewStart
+#       ),
+#     trtedt = case_when(
+#       netxgap < 90 ~ NextEnd,
+#       TRUE ~ trtedt
+#     ),
+#     trtstfl = 1.2
+#   ) |>
+#   select(PatientDurableKey, trtsdt, trtedt, EndProv, trtstfl, trtedfl, StartProv)
+# 
+# course2c <- filter(course1, is.na(FirstEnd)) |>
+#   arrange(PatientDurableKey, trtsdt) |>
+#   group_by(PatientDurableKey) |>
+#   mutate(NextStart = lead(trtsdt, 1)) |>
+#   ungroup() |>
+#   mutate(
+#     trtedt = case_when(
+#       !is.na(NextStart) ~ NextStart - 1,
+#       TRUE ~ trtedt
+#     ),
+#     trtedfl = 1.2
+#   ) |>
+#   select(PatientDurableKey, trtsdt, StartProv, trtedt, EndProv, trtstfl, trtedfl)
+# 
+# course2 <- rbind(course2a, course2b) |>
+#   rbind(course2c) |>
+#   filter(is.na(EndProv) | EndProv == StartProv)
+# 
+# out1 <- select(visit2, PatientDurableKey, adt, CPTCode) |>
+#   inner_join(course2, relationship = "many-to-many") |>
+#   filter(
+#     adt >= trtsdt,
+#     (adt <= trtedt | is.na(trtedt)),
+#     !is.na(CPTCode),
+#     CPTCode != ""
+#   ) |>
+#   group_by(PatientDurableKey, trtsdt, trtedt, StartProv, EndProv, trtstfl, trtedfl) |>
+#   reframe(
+#     VisitCount = length(unique(adt)),
+#     LastSeen = max(adt)
+#   ) |>
+#   filter(
+#     (
+#       (!is.na(trtedt) & trtedt >= "2022-10-01") |
+#         (is.na(trtedt) & VisitCount >= 6 & LastSeen >= "2021-10-01")
+#      ),
+#     !(is.na(trtedt) & LastSeen + 90 >= today())
+#   ) |>
+#   mutate(
+#     LTFUDate = case_when(
+#       is.na(trtedt) ~ LastSeen + 90,
+#       TRUE ~ NA
+#     ),
+#     Month = case_when(
+#       !is.na(trtedt) ~ floor_date(trtedt, "month"),
+#       LTFUDate <= "2022-10-01" ~ as.Date("2022-10-01"),
+#       TRUE ~ ceiling_date(LTFUDate, "month") + 1
+#     ),
+#     LostToFollowUp = ifelse(is.na(trtedt) & !is.na(LTFUDate), "Y", "N"),
+#     trtedt = case_when(
+#       is.na(trtedt) ~ LTFUDate,
+#       TRUE ~ trtedt
+#     ),
+#   ) |>
+#   select(
+#     Month, 
+#     PatientDurableKey, 
+#     trtsdt, 
+#     trtedt, 
+#     DateLastSeen = LastSeen, 
+#     NumberOfSessions = VisitCount, 
+#     LostToFollowUp, 
+#     trtstfl, 
+#     trtedfl
+#     ) |>
+#   arrange(PatientDurableKey, Month)
+# 
+# out2a <- inner_join(
+#   out1,
+#   select(visit2, PatientDurableKey, adt, TreatmentEndBOS = TrueBOS),
+#   join_by(PatientDurableKey, trtedt == adt)
+# ) |>
+#   filter(
+#     LostToFollowUp == "N", 
+#     !is.na(TreatmentEndBOS)
+#     )
+# 
+# out2b <- inner_join(
+#   out1,
+#   select(visit2, PatientDurableKey, adt, TreatmentEndBOS = TrueBOS),
+#   join_by(PatientDurableKey, DateLastSeen == adt)
+# ) |>
+#   filter(
+#     LostToFollowUp == "Y", 
+#     !is.na(TreatmentEndBOS)
+#   )
+# 
+# out2c <- inner_join(
+#   filter(visit2, !is.na(TrueBOS)) |> select(PatientDurableKey, TrueBOS, adt),
+#   out1,
+#   join_by(PatientDurableKey, adt >= trtsdt, adt <= trtedt)
+# ) |>
+#   group_by(PatientDurableKey, trtsdt, trtedt) |>
+#   filter(adt == min(adt)) |>
+#   ungroup() |>
+#   select(
+#     PatientDurableKey, 
+#     trtsdt, 
+#     trtedt, 
+#     FirstBOS = TrueBOS,
+#     FirstBOSDate = adt
+#     )
+# 
+# out2 <- rbind(out2a, out2b) |>
+#   left_join(out2c) |>
+#   filter(Month < floor_date(today(), "month")) |>
+#   mutate(
+#     Numerator = case_when(
+#       TreatmentEndBOS <= 9 ~ 1,
+#       FirstBOS != 0 & (TreatmentEndBOS - FirstBOS) / FirstBOS <= -0.4 ~ 1,
+#       TRUE ~ 0
+#     )
+#   )
