@@ -218,7 +218,6 @@ for(p in ibhfiles){
     group_by(Practice, Month, Network, Aggregation) |>
     reframe(across(II:Crisis, sum)) |>
     ungroup()
-  
   y <- inner_join(ibhfte, x |> distinct(Month)) |>
     group_by(Month) |>
     reframe(FTE = sum(FTE)) |>
@@ -258,6 +257,7 @@ patientbos <- dbGetQuery(con, "
           				,prd.ProviderEpicID
           				,ef.DepartmentKey
           				,ef.VisitTypeKey
+          				,dep.Name AS DepartmentName
   	FROM caboodle.dbo.SurveyAnswerFact sv
       JOIN caboodle.dbo.EncounterFact ef
 			  ON sv.EncounterKey = ef.EncounterKey
@@ -265,10 +265,12 @@ patientbos <- dbGetQuery(con, "
 		  	ON ef.ProviderDurableKey = prd.durablekey
 			JOIN Caboodle.dbo.DateDim d 
 			  ON sv.ResponseDateKey = d.DateKey  
+			JOIN Caboodle.dbo.DepartmentDim dep
+			  ON ef.DepartmentKey = dep.DepartmentKey
     WHERE sv.SurveyQuestionKey = 24552
   		AND sv.Valid = 1
   		AND sv.Count > 0
-  ") 
+  ") |>
   inner_join(
     psych,
     join_by(
@@ -280,26 +282,34 @@ patientbos <- dbGetQuery(con, "
   #mutate(Practice = ifelse(DEPARTMENT == "Psychiatry", DEPARTMENT, AREA)) |>
   mutate(
     Practice = case_when(
-      DEPARTMENT == "BMCP" ~ AREA,
+      AREA == "BMCP" ~ AREA,
+      AREA == "IBH - CHSN" ~ "CHSN",
       !VisitTypeKey %in% c("1536", "3113", "3670", "4246", "6024", "6749", "7333") &
+        DEPARTMENT == "Psychiatry" &
         (
           (AREA == "School-based" & DepartmentKey %in% c(968, 20798)) | 
             AREA != "School-based"
         ) ~ "Psychiatry"
     )
-  )
-  filter(!is.na(Practice)) |>
+  ) |>
   group_by(PatientDurableKey, Practice, ResponseDate) |>
   filter(ResponseTimeKey == max(ResponseTimeKey)) |>
   ungroup() |>
   select(-VisitTypeKey) |>
-  unique()
+  unique() |>
+  group_by(PatientDurableKey, NPI, ResponseDate) |>
+  mutate(
+    rows = n(),
+    DepartmentType = ifelse(str_detect(DepartmentName, "CHSN"), "CHSN", "BMCP")
+    ) |>
+  ungroup() |>
+  filter(rows == 1 | DepartmentType == Practice)
   
 firstbos <- patientbos |>
   group_by(PatientDurableKey, Practice) |>
   filter(ResponseDate == min(ResponseDate)) |>
   ungroup() |>
-  select(PatientDurableKey:Practice)
+  select(PatientDurableKey:ProviderEpicID, Practice)
 
 # Universal crisis prevention visits
 crisis <- dbGetQuery(con, "
@@ -315,6 +325,7 @@ crisis <- dbGetQuery(con, "
             				,dad.DateValue AS EncDate
             				,ef.VisitTypeKey
             				,ef.DepartmentKey
+            				,dep.Name AS DepartmentName
       FROM caboodle.dbo.EncounterFact ef
     		JOIN caboodle.dbo.BillingTransactionFact btf
     			ON btf.EncounterKey = ef.EncounterKey
@@ -324,6 +335,8 @@ crisis <- dbGetQuery(con, "
     			ON ef.DateKey = dad.DateKey
     		JOIN caboodle.dbo.ProviderDim prvd
     			ON ef.ProviderDurableKey = prvd.DurableKey
+    		JOIN Caboodle.dbo.DepartmentDim dep
+    		  ON ef.DepartmentKey = dep.DepartmentKey
       WHERE prvd.StartDate <= dad.DateValue
 			   AND prvd.EndDate >= dad.DateValue
 			   AND btf.BillingProcedureCode IN ('90839', 'S9485')
@@ -343,6 +356,7 @@ crisis <- dbGetQuery(con, "
         			,dad.DateValue
         			,ef.VisitTypeKey
         			,ef.DepartmentKey
+        			,dep.Name
     ") |>
   inner_join(
     psych,
@@ -354,15 +368,25 @@ crisis <- dbGetQuery(con, "
   ) |>
   mutate(
     Practice = case_when(
-      DEPARTMENT == "BMCP" ~ AREA,
+      AREA == "BMCP" ~ AREA,
+      AREA == "IBH - CHSN" ~ "CHSN",
       !VisitTypeKey %in% c("1536", "3113", "3670", "4246", "6024", "6749", "7333") &
+        DEPARTMENT == "Psychiatry" &
         (
           (AREA == "School-based" & DepartmentKey %in% c(968, 20798)) | 
             AREA != "School-based"
-          ) ~ "Psychiatry"
+        ) ~ "Psychiatry"
     )
   ) |>
   filter(!is.na(Practice)) |>
+  group_by(PatientDurableKey, ProviderEpicID, EncDate) |>
+  mutate(
+    rows = n(),
+    DepartmentType = ifelse(str_detect(DepartmentName, "CHSN"), "CHSN", "BMCP")
+    ) |>
+  ungroup() |>
+  filter(rows == 1 | DepartmentType == Practice) |>
+  filter(Practice %in% c("Psychiatry", "BMCP")) |>
   mutate(Month = floor_date(EncDate, "month")) |>
   inner_join(
     select(firstbos, ResponseDate, PatientDurableKey),
@@ -393,8 +417,8 @@ crisis <- dbGetQuery(con, "
 # Get all initial intake visits by cpt from billing transactions
 # Should contain both hospital and professional
 
-intake2 <- dbGetQuery(con, "
-  SELECT DISTINCT ef.patientdurablekey
+ii <- dbGetQuery(con, "
+  SELECT DISTINCT ef.PatientDurableKey
           				,PrimaryMRN
           				,ef.EncounterEpicCSN
           				,ef.EncounterKey
@@ -406,6 +430,7 @@ intake2 <- dbGetQuery(con, "
           				,dad.DateValue AS EncDate
           				,ef.VisitTypeKey
           				,ef.DepartmentKey
+          				,dep.Name AS DepartmentName
     FROM caboodle.dbo.EncounterFact ef
   		JOIN caboodle.dbo.BillingTransactionFact btf
   			ON btf.EncounterKey = ef.EncounterKey
@@ -415,6 +440,8 @@ intake2 <- dbGetQuery(con, "
   			ON ef.DateKey = dad.DateKey
   		JOIN caboodle.dbo.ProviderDim prvd
   			ON ef.ProviderDurableKey = prvd.DurableKey
+  		JOIN Caboodle.dbo.DepartmentDim dep
+  		  ON ef.DepartmentKey = dep.DepartmentKey
   	WHERE prvd.StartDate <= dad.DateValue
 			AND prvd.EndDate >= dad.DateValue
 			AND btf.BillingProcedureCode = '90791'
@@ -435,6 +462,7 @@ intake2 <- dbGetQuery(con, "
       			,dateadd(month, datediff(month, 0, dad.datevalue), 0)
       			,ef.VisitTypeKey
       			,ef.DepartmentKey
+      			,dep.Name
     ") |>
   inner_join(
     psych,
@@ -446,7 +474,8 @@ intake2 <- dbGetQuery(con, "
   ) |>
   mutate(
     Practice = case_when(
-      DEPARTMENT == "BMCP" ~ AREA,
+      AREA == "BMCP" ~ AREA,
+      AREA == "IBH - CHSN" ~ "CHSN",
       !VisitTypeKey %in% c("1536", "3113", "3670", "4246", "6024", "6749", "7333") &
         (
           (AREA == "School-based" & DepartmentKey %in% c(968, 20798)) | 
@@ -455,9 +484,14 @@ intake2 <- dbGetQuery(con, "
     ),
     Month = floor_date(EncDate, "month")
   ) |>
-  filter(!is.na(Practice))
-
-ii <- intake2 |>
+  filter(!is.na(Practice)) |>
+  group_by(PatientDurableKey, ProviderEpicID, EncDate) |>
+  mutate(
+    rows = n(),
+    DepartmentType = ifelse(str_detect(DepartmentName, "CHSN"), "CHSN", "BMCP")
+  ) |>
+  filter(rows == 1 | DepartmentType == Practice) |>
+  ungroup() |>
   filter(
     Month >= "2022-10-01",
     CPTQty > 0
@@ -488,6 +522,7 @@ etx1a <- dbGetQuery(con, "
           				,prd.DurableKey AS ProviderDurableKey
           				,prd.ProviderEpicID
           				,ef.DepartmentKey
+          				,dep.Name AS DepartmentName
   	FROM caboodle.dbo.FlowsheetValueFact a
   		JOIN caboodle.dbo.DateDim dad
   			ON a.DateKey = dad.DateKey
@@ -496,6 +531,8 @@ etx1a <- dbGetQuery(con, "
   				AND ef.Count > 0
   		JOIN caboodle.dbo.ProviderDim prd
   			ON ef.ProviderDurableKey = prd.DurableKey
+  		JOIN Caboodle.dbo.DepartmentDim dep
+  		  ON ef.DepartmentKey = dep.DepartmentKey
   	WHERE a.FlowsheetRowKey = 40093
   		AND a.Value = 'End of Active Tx'
   		AND a.Count > 0
@@ -511,13 +548,21 @@ etx1a <- dbGetQuery(con, "
   ) |>
   mutate(
     Practice = case_when(
+      AREA == "BMCP" ~ AREA,
+      AREA == "IBH - CHSN" ~ "CHSN",
       DepartmentKey %in% c(968, 20798) | 
         (DEPARTMENT == "Psychiatry" & AREA != "School-based") ~ "Psychiatry",
-      DEPARTMENT == "BMCP" ~ AREA
     )
   ) |>
+  filter(!is.na(Practice)) |>
   group_by(PatientDurableKey, Practice, DateKey) |>
   filter(TakenInstant == max(TakenInstant)) |>
+  group_by(PatientDurableKey, ProviderEpicID, DateKey) |>
+  mutate(
+    rows = n(),
+    DepartmentType = ifelse(str_detect(DepartmentName, "CHSN"), "CHSN", "BMCP")
+  ) |>
+  filter(rows == 1 | DepartmentType == Practice) |>
   ungroup()
 
 # Get BOS at etx
@@ -531,11 +576,14 @@ providerbos <- dbGetQuery(con, "
           				,fv.TakenInstant
           				,prd.ProviderEpicID
           				,ef.DepartmentKey
+          				,dep.Name AS DepartmentName
   	FROM caboodle.dbo.FlowsheetValueFact fv
   		JOIN caboodle.dbo.EncounterFact ef
   			ON fv.EncounterKey = ef.EncounterKey
       JOIN Caboodle.dbo.ProviderDim prd
   			ON ef.ProviderDurableKey = prd.DurableKey
+  		JOIN Caboodle.dbo.DepartmentDim dep
+  		  ON ef.DepartmentKey = dep.DepartmentKey
     WHERE fv.count > 0
   		AND fv.FlowsheetRowKey = 51011
     ") |>
@@ -550,14 +598,21 @@ providerbos <- dbGetQuery(con, "
     ) |>
   mutate(
     Practice = case_when(
+      AREA == "BMCP" ~ AREA,
+      AREA == "IBH - CHSN" ~ "CHSN",
       DepartmentKey %in% c(968, 20798) | 
         (DEPARTMENT == "Psychiatry" & AREA != "School-based") ~ "Psychiatry",
-      DEPARTMENT == "BMCP" ~ AREA
     )
   ) |>
   group_by(PatientDurableKey, DateKey) |>
   filter(FirstDocumentedInstant == max(FirstDocumentedInstant)) |>
   filter(TakenInstant == max(TakenInstant)) |>
+  group_by(PatientDurableKey, ProviderEpicID, DateKey) |>
+  mutate(
+    rows = n(),
+    DepartmentType = ifelse(str_detect(DepartmentName, "CHSN"), "CHSN", "BMCP")
+  ) |>
+  filter(rows == 1 | DepartmentType == Practice) |>
   ungroup()
   
 etx1b1 <- providerbos |>
@@ -610,6 +665,7 @@ visit1a <- dbGetQuery(con, "
           				,btf.BillingProcedureQuantity
           				,ef.VisitTypeKey
           				,ef.DepartmentKey
+          				,dep.Name AS DepartmentName
   	FROM caboodle.dbo.EncounterFact ef
   		JOIN caboodle.dbo.BillingTransactionFact btf
   			ON btf.EncounterKey = ef.EncounterKey
@@ -619,6 +675,8 @@ visit1a <- dbGetQuery(con, "
   			ON ef.DateKey = dad.DateKey
   		JOIN caboodle.dbo.ProviderDim prvd
   			ON ef.ProviderDurableKey = prvd.DurableKey
+  		JOIN Caboodle.dbo.DepartmentDim dep
+  		  ON ef.DepartmentKey = dep.DepartmentKey
   	WHERE btf.BillingProcedureCode in  (
       	'90791', '90832', '90834', '90837',
       	'90839', '90840', '90846', '90847'
@@ -642,13 +700,21 @@ visit1a <- dbGetQuery(con, "
     Practice = case_when(
       DepartmentKey %in% c(968, 20798) | 
         (DEPARTMENT == "Psychiatry" & AREA != "School-based") ~ "Psychiatry",
-      DEPARTMENT == "BMCP" ~ AREA
+      AREA == "BMCP" ~ AREA,
+      AREA == "IBH - CHSN" ~ "CHSN"
     )
   ) |>
   filter(
     !VisitTypeKey %in% c('1536','3113','3670','4246','6024','6749','7333') |
       Practice != "Psychiatry",
     !is.na(Practice)
+  ) |>
+  mutate(
+    DepartmentType = ifelse(
+      str_detect(DepartmentName, "CHSN"), 
+      "CHSN", 
+      "BMCP"
+      )
   ) |>
   group_by(
     PatientDurableKey,
@@ -660,11 +726,16 @@ visit1a <- dbGetQuery(con, "
     ProviderEpicID,
     ProviderName,
     ProcDate,
-    Practice
+    Practice,
+    DepartmentType
   ) |>
   reframe(CPTQty = sum(BillingProcedureQuantity)) |>
   filter(CPTQty > 0) |>
-  mutate(trtstfl = ifelse(cptcode == "90791", 1, 0))
+  mutate(trtstfl = ifelse(cptcode == "90791", 1, 0)) |>
+  group_by(PatientDurableKey, ProviderEpicID, ProcDate, cptcode, EncounterKey) |>
+  mutate(rows = n()) |>
+  ungroup() |>
+  filter(rows == 1 | DepartmentType == Practice) 
 
 #patientbos
 visit1b1 <- patientbos |>
@@ -1066,7 +1137,7 @@ proboslines <- probos |>
   ) |>
   mutate(
     Measure = "PRO BOS",
-    Network = ifelse(Practice == "Community IBH", "IBH", "PINQ BH"),
+    Network = ifelse(Practice == "CHSN", "IBH", "PINQ BH"),
     Aggregation = "Practice"
   )
 
@@ -1578,7 +1649,8 @@ cibhboslines <- ends |>
   ungroup() |>
   mutate(
     Month = floor_date(EndDate, "month"),
-    Numerator = ScoreEnd <= 9 | ScoreEnd < .6 * ScoreStart
+    Numerator = ScoreEnd <= 9 | ScoreEnd < .6 * ScoreStart,
+    Practice = "Community IBH"
     ) |>
   group_by(Practice, Month) |>
   reframe(
@@ -1591,7 +1663,7 @@ cibhboslines <- ends |>
     Aggregation = "Practice"
   ) |>
   filter(Month < floor_date(today(), "month")) |>
-  rbind(filter(proboslines, Practice == "IBH - CHSN") |> mutate(Network = "IBH"))
+  rbind(filter(proboslines, Practice == "CHSN"))
 
 setwd("~/Behavioral Health/PINQ/PINQ-Dashboard")
 
@@ -1802,7 +1874,7 @@ popb <- dbGetQuery(con, "
 		AND dad.DateValue > '2021-12-01'
   ") |>
   inner_join(
-    filter(psych, DEPARTMENT == "BMCP"), 
+    filter(psych, AREA == "BMCP"), 
     join_by(
       ProviderEpicID == PROV_ID, 
       EncounterDate >= START_DATE, 
